@@ -11,7 +11,7 @@
 
 Connect your NASA ADS libraries directly to Overleaf. Search, cite, and export BibTeX without leaving the editor.
 
-![ADS for Overleaf Screenshot](docs/screenshot.png)
+![ADS for Overleaf Screenshot](docs/screenshot.jpg)
 
 ## Features
 

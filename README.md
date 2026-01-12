@@ -1,5 +1,9 @@
 # ADS for Overleaf
 
+<p align="center">
+  <img src="icons/icon.svg" alt="ADS for Overleaf Logo" width="128" height="128">
+</p>
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Chrome Web Store](https://img.shields.io/badge/Chrome-Extension-green.svg)](#installation)
 [![Firefox Add-ons](https://img.shields.io/badge/Firefox-Add--on-orange.svg)](#installation)

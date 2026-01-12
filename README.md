@@ -4,9 +4,10 @@
   <img src="icons/icon.svg" alt="ADS for Overleaf Logo" width="128" height="128">
 </p>
 
+[![Download Latest Release](https://img.shields.io/github/v/release/yipihey/ads-for-overleaf?label=Download&style=for-the-badge)](https://github.com/yipihey/ads-for-overleaf/releases/latest)
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Chrome Web Store](https://img.shields.io/badge/Chrome-Extension-green.svg)](#installation)
-[![Firefox Add-ons](https://img.shields.io/badge/Firefox-Add--on-orange.svg)](#installation)
+[![GitHub Release](https://img.shields.io/github/v/release/yipihey/ads-for-overleaf)](https://github.com/yipihey/ads-for-overleaf/releases/latest)
 
 Connect your NASA ADS libraries directly to Overleaf. Search, cite, and export BibTeX without leaving the editor.
 

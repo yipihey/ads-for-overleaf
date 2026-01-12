@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Build release zip
+        run: |
+          chmod +x scripts/release.sh
+          ./scripts/release.sh
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: ADS for Overleaf v${{ steps.version.outputs.VERSION }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: build/ads-for-overleaf-v${{ steps.version.outputs.VERSION }}.zip
+          body: |
+            ## Installation
+
+            1. Download `ads-for-overleaf-v${{ steps.version.outputs.VERSION }}.zip` below
+            2. Unzip the file
+            3. Open your browser's extension page:
+               - **Chrome**: `chrome://extensions/`
+               - **Edge**: `edge://extensions/`
+               - **Brave**: `brave://extensions/`
+               - **Firefox**: `about:debugging#/runtime/this-firefox`
+            4. Enable "Developer mode" (Chrome/Edge/Brave) or click "Load Temporary Add-on" (Firefox)
+            5. Click "Load unpacked" and select the unzipped folder
+            6. Get your [ADS API token](https://ui.adsabs.harvard.edu/user/settings/token) and configure it in the extension
+
+            See [full installation guide](https://github.com/yipihey/ads-for-overleaf/blob/main/docs/INSTALLATION.md) for detailed instructions.

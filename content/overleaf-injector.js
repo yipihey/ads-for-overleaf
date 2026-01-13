@@ -1634,10 +1634,13 @@
       const existingBibcodes = new Set();
       const existingDois = new Set();
 
+      // Helper to normalize bibcodes (remove dots for comparison)
+      const normalizeBibcode = (bc) => bc.replace(/\./g, '').toLowerCase();
+
       // Match adsurl fields to extract bibcodes (use non-greedy match)
       const bibcodeMatches = bibtexContent.matchAll(/\/abs\/([A-Za-z0-9.]+)/gi);
       for (const match of bibcodeMatches) {
-        existingBibcodes.add(match[1]);
+        existingBibcodes.add(normalizeBibcode(match[1]));
       }
 
       // Match DOI fields (handle both brace and quote delimiters)
@@ -1646,26 +1649,33 @@
         existingDois.add(match[1].toLowerCase());
       }
 
-      // Check citation keys that look like bibcodes (19 chars, starts with year)
+      // Check citation keys that look like bibcodes (starts with year, reasonable length)
       const keyMatches = bibtexContent.matchAll(/@\w+\s*\{\s*(\d{4}[A-Za-z&][^\s,]+)/g);
       for (const match of keyMatches) {
-        if (match[1].length === 19) {
-          existingBibcodes.add(match[1]);
+        // Accept bibcodes between 18-20 chars (arXiv bibcodes vary)
+        if (match[1].length >= 18 && match[1].length <= 20) {
+          existingBibcodes.add(normalizeBibcode(match[1]));
         }
       }
 
       // Debug: log what we found
       console.log(`ADS: Found ${existingBibcodes.size} bibcodes and ${existingDois.size} DOIs in .bib`);
+      console.log('ADS: Sample bibcodes from .bib:', [...existingBibcodes].slice(0, 5));
 
       // Count papers NOT in .bib
       let missingCount = 0;
       const missingPapers = [];
       for (const doc of state.documents) {
-        const inBibcode = existingBibcodes.has(doc.bibcode);
+        const normalizedDocBibcode = normalizeBibcode(doc.bibcode);
+        const inBibcode = existingBibcodes.has(normalizedDocBibcode);
         const inDoi = doc.doi && existingDois.has(doc.doi[0]?.toLowerCase());
         if (!inBibcode && !inDoi) {
           missingCount++;
           missingPapers.push(doc.bibcode);
+          // Debug: show why this paper didn't match
+          if (missingPapers.length <= 3) {
+            console.log(`ADS: Paper ${doc.bibcode} (normalized: ${normalizedDocBibcode}) not matched. DOI: ${doc.doi?.[0]}`);
+          }
         }
       }
 

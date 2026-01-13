@@ -115,10 +115,11 @@ async function getLibraryDocuments(libraryId, forceRefresh = false) {
   }
 
   const client = await getClient();
-  const result = await client.getLibraryDocuments(libraryId);
-  
+  // Fetch up to 3000 documents to support large libraries
+  const result = await client.getLibraryDocuments(libraryId, 0, 3000);
+
   await Storage.setCachedLibraryDocs(libraryId, result.documents);
-  
+
   return { documents: result.documents, fromCache: false };
 }
 

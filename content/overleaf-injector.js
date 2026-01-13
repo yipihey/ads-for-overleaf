@@ -30,6 +30,7 @@
     sidebarVisible: false,
     currentBibFile: null, // Name of currently open .bib file (if any)
     isScrollCollecting: false, // True during scroll-based content collection
+    librarySearchQuery: '', // Current search/filter query for library view
   };
 
   // DOM Elements
@@ -205,17 +206,6 @@
         <button class="ads-close-btn" title="Close panel" aria-label="Close ADS panel">&times;</button>
       </div>
 
-      <div class="ads-search-container" role="search">
-        <label for="ads-search-input" class="visually-hidden">Search NASA ADS</label>
-        <input type="text" id="ads-search-input" placeholder="Search ADS or your libraries..."
-               aria-label="Search NASA ADS or your libraries" />
-        <button id="ads-search-btn" title="Search" aria-label="Execute search">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true">
-            <path d="M15.5 14h-.79l-.28-.27a6.5 6.5 0 0 0 1.48-5.34c-.47-2.78-2.79-5-5.59-5.34a6.505 6.505 0 0 0-7.27 7.27c.34 2.8 2.56 5.12 5.34 5.59a6.5 6.5 0 0 0 5.34-1.48l.27.28v.79l4.25 4.25c.41.41 1.08.41 1.49 0 .41-.41.41-1.08 0-1.49L15.5 14zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/>
-          </svg>
-        </button>
-      </div>
-
       <div class="ads-bib-actions" id="ads-bib-actions">
         <button id="ads-import-bib-btn" class="ads-action-btn"
                 title="Import entries from current .bib file to an ADS library">
@@ -224,6 +214,17 @@
         <button id="ads-sync-to-bib-btn" class="ads-action-btn"
                 title="Add missing papers from selected library to .bib file">
           <span class="ads-btn-icon">↓</span> Add to .bib
+        </button>
+      </div>
+
+      <div class="ads-search-container" role="search">
+        <label for="ads-search-input" class="visually-hidden">Search</label>
+        <input type="text" id="ads-search-input" placeholder="Filter library entries..."
+               aria-label="Filter library entries or search NASA ADS" />
+        <button id="ads-search-btn" title="Search" aria-label="Execute search">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true">
+            <path d="M15.5 14h-.79l-.28-.27a6.5 6.5 0 0 0 1.48-5.34c-.47-2.78-2.79-5-5.59-5.34a6.505 6.505 0 0 0-7.27 7.27c.34 2.8 2.56 5.12 5.34 5.59a6.5 6.5 0 0 0 5.34-1.48l.27.28v.79l4.25 4.25c.41.41 1.08.41 1.49 0 .41-.41.41-1.08 0-1.49L15.5 14zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/>
+          </svg>
         </button>
       </div>
 
@@ -263,9 +264,16 @@
     // Event listeners
     sidebar.querySelector('.ads-close-btn').addEventListener('click', hideSidebar);
     sidebar.querySelector('#ads-search-input').addEventListener('keypress', handleSearchKeypress);
+    sidebar.querySelector('#ads-search-input').addEventListener('input', handleSearchInput);
     sidebar.querySelector('#ads-search-btn').addEventListener('click', performSearch);
     sidebar.querySelector('#ads-library-select').addEventListener('change', handleLibraryChange);
-    sidebar.querySelector('#ads-refresh-btn').addEventListener('click', () => loadLibraries(true));
+    sidebar.querySelector('#ads-refresh-btn').addEventListener('click', async () => {
+      await loadLibraries(true);
+      // Also reload current library's documents to get fresh data
+      if (state.currentLibrary) {
+        await loadDocuments(state.currentLibrary, true);
+      }
+    });
 
     // Tab switching with keyboard support
     sidebar.querySelectorAll('.ads-tab').forEach(tab => {
@@ -429,6 +437,40 @@
         c.setAttribute('hidden', '');
       }
     });
+
+    // Update search placeholder based on active tab
+    updateSearchPlaceholder();
+
+    // Clear search input and filter when switching tabs
+    sidebar.querySelector('#ads-search-input').value = '';
+    state.librarySearchQuery = '';
+  }
+
+  /**
+   * Update search placeholder based on active tab
+   */
+  function updateSearchPlaceholder() {
+    const input = sidebar.querySelector('#ads-search-input');
+    const isLibrariesTab = sidebar.querySelector('#tab-libraries').classList.contains('active');
+    input.placeholder = isLibrariesTab ? 'Filter library entries...' : 'Search NASA ADS...';
+  }
+
+  /**
+   * Get filtered documents based on current search query
+   */
+  function getFilteredDocuments() {
+    if (!state.librarySearchQuery) {
+      return state.documents;
+    }
+
+    const query = state.librarySearchQuery;
+    return state.documents.filter(doc => {
+      const title = (Array.isArray(doc.title) ? doc.title[0] : doc.title || '').toLowerCase();
+      const authors = (doc.author || []).join(' ').toLowerCase();
+      const year = String(doc.year || '');
+      const bibcode = (doc.bibcode || '').toLowerCase();
+      return title.includes(query) || authors.includes(query) || year.includes(query) || bibcode.includes(query);
+    });
   }
 
   /**
@@ -484,6 +526,10 @@
     const libraryId = event.target.value;
     const linkBtn = sidebar.querySelector('#ads-library-link');
 
+    // Clear search filter when changing libraries
+    state.librarySearchQuery = '';
+    sidebar.querySelector('#ads-search-input').value = '';
+
     if (!libraryId) {
       state.currentLibrary = null;
       state.documents = [];
@@ -522,7 +568,7 @@
   }
 
   /**
-   * Render documents list
+   * Render documents list (filtered if search query active)
    */
   function renderDocuments() {
     const container = sidebar.querySelector('#ads-documents-list');
@@ -532,7 +578,14 @@
       return;
     }
 
-    container.innerHTML = state.documents.map(doc => renderDocumentItem(doc)).join('');
+    const docs = getFilteredDocuments();
+
+    if (docs.length === 0) {
+      container.innerHTML = '<div class="ads-empty" role="status">No matching entries</div>';
+      return;
+    }
+
+    container.innerHTML = docs.map(doc => renderDocumentItem(doc)).join('');
 
     // Add click and keyboard handlers
     attachDocumentHandlers(container);
@@ -613,15 +666,39 @@
   }
 
   /**
-   * Perform ADS search
+   * Handle search input - real-time filtering for Libraries tab only
+   */
+  function handleSearchInput() {
+    const isLibrariesTab = sidebar.querySelector('#tab-libraries').classList.contains('active');
+    if (isLibrariesTab) {
+      performSearch();
+    }
+  }
+
+  /**
+   * Perform search - context-aware based on active tab
    */
   async function performSearch() {
     const input = sidebar.querySelector('#ads-search-input');
     const query = input.value.trim();
-    
+    const isLibrariesTab = sidebar.querySelector('#tab-libraries').classList.contains('active');
+
+    if (isLibrariesTab) {
+      // Client-side filtering of library documents
+      state.librarySearchQuery = query.toLowerCase();
+      renderDocuments();
+      if (query) {
+        const filtered = getFilteredDocuments();
+        setStatus(`Showing ${filtered.length} of ${state.documents.length} entries`);
+      } else {
+        setStatus('');
+      }
+      return;
+    }
+
+    // ADS API search (Search ADS tab)
     if (!query) return;
 
-    switchTab('search');
     setLoading(true);
 
     try {
@@ -629,7 +706,7 @@
         action: 'search',
         payload: { query, rows: 20 }
       });
-      
+
       state.searchResults = result.documents || [];
       renderSearchResults();
       setStatus(`Found ${result.numFound} results`);
@@ -1060,15 +1137,11 @@
           try {
             const obj = cmEditor[key];
             if (obj && obj.view && obj.view.state && obj.view.state.doc) {
-              const content = obj.view.state.doc.toString();
-              console.log('ADS: Read full content via CM6 view state, length:', content.length);
-              resolve(content);
+              resolve(obj.view.state.doc.toString());
               return;
             }
             if (obj && obj.state && obj.state.doc) {
-              const content = obj.state.doc.toString();
-              console.log('ADS: Read full content via CM6 state, length:', content.length);
-              resolve(content);
+              resolve(obj.state.doc.toString());
               return;
             }
           } catch (e) {
@@ -1082,10 +1155,8 @@
       const cmScroller = document.querySelector('.cm-scroller');
       const cmContent = document.querySelector('.cm-content');
       if (cmScroller && cmContent) {
-        console.log('ADS: Attempting scroll-based content collection for CM6');
         const content = await scrollAndCollectCM6Content(cmScroller, cmContent);
         if (content) {
-          console.log('ADS: Collected full content via scroll, length:', content.length);
           resolve(content);
           return;
         }
@@ -1095,15 +1166,12 @@
       if (cmContent) {
         const lines = cmContent.querySelectorAll('.cm-line');
         if (lines.length > 0) {
-          const content = Array.from(lines).map(line => line.textContent).join('\n');
-          console.log('ADS: Read content via cm-line elements, length:', content.length, '(visible lines:', lines.length, ')');
-          resolve(content);
+          resolve(Array.from(lines).map(line => line.textContent).join('\n'));
           return;
         }
 
         const content = cmContent.textContent;
         if (content) {
-          console.log('ADS: Read content via cm-content textContent, length:', content.length);
           resolve(content);
           return;
         }
@@ -1114,9 +1182,7 @@
       if (aceContent) {
         const lines = aceContent.querySelectorAll('.ace_line');
         if (lines.length > 0) {
-          const content = Array.from(lines).map(line => line.textContent).join('\n');
-          console.log('ADS: Read content via ace_line elements, length:', content.length);
-          resolve(content);
+          resolve(Array.from(lines).map(line => line.textContent).join('\n'));
           return;
         }
       }
@@ -1126,13 +1192,11 @@
       if (editorContainer) {
         const content = editorContainer.textContent;
         if (content && content.trim().length > 0) {
-          console.log('ADS: Read content via editor container, length:', content.length);
           resolve(content);
           return;
         }
       }
 
-      console.log('ADS: Could not read editor content');
       resolve(null);
     });
   }
@@ -1204,7 +1268,6 @@
     const scrollStep = clientHeight - 50; // Small overlap to not miss lines
     let currentScroll = 0;
 
-    console.log('ADS: Starting scroll collection, scrollHeight:', scrollHeight);
     state.isScrollCollecting = true;
 
     try {
@@ -1219,9 +1282,6 @@
       scroller.scrollTop = scrollHeight;
       await sleep(30);
       collectVisibleLines();
-
-      console.log('ADS: Collected', lineMap.size, 'unique lines');
-
     } finally {
       // Restore original scroll position and clear flag
       scroller.scrollTop = originalScroll;
@@ -1417,7 +1477,6 @@
    * Start the import scan process
    */
   async function startImportScan() {
-    console.log('ADS: Starting import scan...');
 
     const modalContent = importModal.querySelector('.ads-modal-body');
     const configStep = modalContent.querySelector('#ads-import-step-config');
@@ -1430,7 +1489,6 @@
     const newLibDesc = modalContent.querySelector('#ads-new-lib-desc').value.trim();
     const existingLibId = modalContent.querySelector('#ads-import-lib-select').value;
 
-    console.log('ADS: Config - isNewLibrary:', isNewLibrary, 'name:', newLibName);
 
     if (isNewLibrary && !newLibName) {
       setError('Please enter a library name');
@@ -1450,10 +1508,8 @@
 
     // Phase 1: Reading file
     progressText.innerHTML = '<span class="ads-spinner"></span>Reading file...';
-    console.log('ADS: Reading editor content...');
 
     const bibtexContent = await readEditorContent();
-    console.log('ADS: Editor content length:', bibtexContent?.length || 0);
 
     if (!bibtexContent) {
       progressStep.style.display = 'none';
@@ -1465,13 +1521,11 @@
     try {
       // Phase 2: Resolving entries
       progressText.innerHTML = '<span class="ads-spinner"></span>Resolving entries (this may take a while)...';
-      console.log('ADS: Sending resolveBibtex request...');
 
       const result = await sendMessage({
         action: 'resolveBibtex',
         payload: { bibtexContent }
       });
-      console.log('ADS: Got result:', result);
 
       // Phase 3: Show results
       progressBar.classList.remove('indeterminate');
@@ -1630,57 +1684,97 @@
       const bibtexContent = await readEditorContent();
       if (!bibtexContent) return 0;
 
-      // Extract existing bibcodes and DOIs from .bib content
+      // Extract existing identifiers from .bib content
       const existingBibcodes = new Set();
       const existingDois = new Set();
+      const existingArxivIds = new Set();
 
       // Helper to normalize bibcodes (remove dots for comparison)
       const normalizeBibcode = (bc) => bc.replace(/\./g, '').toLowerCase();
 
-      // Match adsurl fields to extract bibcodes (use non-greedy match)
+      // Helper to normalize and validate arXiv IDs
+      // Returns null if not a valid arXiv ID format (YYMM.nnnnn)
+      const normalizeArxivId = (id) => {
+        const cleaned = id.replace(/^arXiv:/i, '').trim().toLowerCase();
+        // Validate it's a modern arXiv ID format: YYMM.nnnnn (4 digits, dot, 4-5 digits)
+        if (/^\d{4}\.\d{4,5}$/.test(cleaned)) {
+          return cleaned;
+        }
+        return null;
+      };
+
+      // Match adsurl fields to extract bibcodes
       const bibcodeMatches = bibtexContent.matchAll(/\/abs\/([A-Za-z0-9.]+)/gi);
       for (const match of bibcodeMatches) {
         existingBibcodes.add(normalizeBibcode(match[1]));
       }
 
-      // Match DOI fields (handle both brace and quote delimiters)
-      const doiMatches = bibtexContent.matchAll(/doi\s*=\s*[{"]([^}"]+)[}"]/gi);
+      // Match DOI fields (handle braces, quotes, and nested braces)
+      const doiMatches = bibtexContent.matchAll(/doi\s*=\s*\{?\{?["']?([0-9][0-9./\-A-Za-z:]+)["']?\}?\}?/gi);
       for (const match of doiMatches) {
-        existingDois.add(match[1].toLowerCase());
+        const doi = match[1].replace(/[{}"']/g, '').trim();
+        if (doi) existingDois.add(doi.toLowerCase());
+      }
+
+      // Match eprint fields (handle braces and quotes)
+      const eprintMatches = bibtexContent.matchAll(/eprint\s*=\s*[{"']?([^}"',]+)[}"']?/gi);
+      for (const match of eprintMatches) {
+        const arxivId = normalizeArxivId(match[1]);
+        if (arxivId) existingArxivIds.add(arxivId);
+      }
+
+      // Also look for arXiv IDs anywhere in the content (arXiv:YYMM.nnnnn pattern)
+      const arxivPatternMatches = bibtexContent.matchAll(/arXiv[:\s]+(\d{4}\.\d{4,5})/gi);
+      for (const match of arxivPatternMatches) {
+        existingArxivIds.add(match[1].toLowerCase());
+      }
+
+      // Also check for bare arXiv ID pattern in eprint-like contexts
+      const bareArxivMatches = bibtexContent.matchAll(/(?:eprint|arxiv|eid)[^=]*=\s*[{"']?(?:arXiv:)?(\d{4}\.\d{4,5})/gi);
+      for (const match of bareArxivMatches) {
+        existingArxivIds.add(match[1].toLowerCase());
       }
 
       // Check citation keys that look like bibcodes (starts with year, reasonable length)
       const keyMatches = bibtexContent.matchAll(/@\w+\s*\{\s*(\d{4}[A-Za-z&][^\s,]+)/g);
       for (const match of keyMatches) {
+        const key = match[1];
         // Accept bibcodes between 18-20 chars (arXiv bibcodes vary)
-        if (match[1].length >= 18 && match[1].length <= 20) {
-          existingBibcodes.add(normalizeBibcode(match[1]));
+        if (key.length >= 18 && key.length <= 20) {
+          existingBibcodes.add(normalizeBibcode(key));
+        }
+        // Extract arXiv ID from arXiv bibcode keys like "2025arXiv251022043B"
+        // Pattern: YYYYarXivYYMMnnnnnL -> arXiv ID is YYMM.nnnnn
+        const arxivKeyMatch = key.match(/^\d{4}arXiv(\d{4})(\d{5})[A-Za-z]$/i);
+        if (arxivKeyMatch) {
+          const arxivId = `${arxivKeyMatch[1]}.${arxivKeyMatch[2]}`;
+          existingArxivIds.add(arxivId.toLowerCase());
         }
       }
 
-      // Debug: log what we found
-      console.log(`ADS: Found ${existingBibcodes.size} bibcodes and ${existingDois.size} DOIs in .bib`);
-      console.log('ADS: Sample bibcodes from .bib:', [...existingBibcodes].slice(0, 5));
+      // Helper to extract arXiv ID from document identifiers
+      const getDocArxivId = (doc) => {
+        if (!doc.identifier) return null;
+        for (const id of doc.identifier) {
+          // Match formats like "arXiv:2510.22043" or just "2510.22043"
+          const match = id.match(/(?:arXiv:)?(\d{4}\.\d{4,5})/i);
+          if (match) return match[1].toLowerCase();
+        }
+        return null;
+      };
 
       // Count papers NOT in .bib
       let missingCount = 0;
-      const missingPapers = [];
       for (const doc of state.documents) {
         const normalizedDocBibcode = normalizeBibcode(doc.bibcode);
         const inBibcode = existingBibcodes.has(normalizedDocBibcode);
         const inDoi = doc.doi && existingDois.has(doc.doi[0]?.toLowerCase());
-        if (!inBibcode && !inDoi) {
-          missingCount++;
-          missingPapers.push(doc.bibcode);
-          // Debug: show why this paper didn't match
-          if (missingPapers.length <= 3) {
-            console.log(`ADS: Paper ${doc.bibcode} (normalized: ${normalizedDocBibcode}) not matched. DOI: ${doc.doi?.[0]}`);
-          }
-        }
-      }
+        const docArxivId = getDocArxivId(doc);
+        const inArxiv = docArxivId && existingArxivIds.has(docArxivId);
 
-      if (missingCount > 0) {
-        console.log(`ADS: ${missingCount} papers not in .bib:`, missingPapers.slice(0, 5));
+        if (!inBibcode && !inDoi && !inArxiv) {
+          missingCount++;
+        }
       }
 
       return missingCount;
@@ -1739,34 +1833,86 @@
 
       const libraryDocs = libraryResult.documents || [];
 
-      // Parse existing .bib to find which keys already exist
-      // We need to compare bibcodes
+      // Parse existing .bib to find which papers already exist
       const existingBibcodes = new Set();
       const existingDois = new Set();
+      const existingArxivIds = new Set();
 
-      // Simple regex to extract bibcodes and DOIs from existing .bib
-      const bibcodeMatches = bibtexContent.matchAll(/adsurl\s*=\s*\{[^}]*\/abs\/([^\}\/]+)/gi);
+      // Normalize bibcodes (remove dots for comparison)
+      const normalizeBibcode = (bc) => bc.replace(/\./g, '').toLowerCase();
+      // Normalize and validate arXiv IDs
+      const normalizeArxivId = (id) => {
+        const cleaned = id.replace(/^arXiv:/i, '').trim().toLowerCase();
+        if (/^\d{4}\.\d{4,5}$/.test(cleaned)) {
+          return cleaned;
+        }
+        return null;
+      };
+
+      // Extract bibcodes from adsurl fields
+      const bibcodeMatches = bibtexContent.matchAll(/\/abs\/([A-Za-z0-9.]+)/gi);
       for (const match of bibcodeMatches) {
-        existingBibcodes.add(match[1]);
+        existingBibcodes.add(normalizeBibcode(match[1]));
       }
 
-      const doiMatches = bibtexContent.matchAll(/doi\s*=\s*\{([^\}]+)\}/gi);
+      // Extract DOIs (handle braces, quotes, nested braces)
+      const doiMatches = bibtexContent.matchAll(/doi\s*=\s*\{?\{?["']?([0-9][0-9./\-A-Za-z:]+)["']?\}?\}?/gi);
       for (const match of doiMatches) {
-        existingDois.add(match[1].toLowerCase());
+        const doi = match[1].replace(/[{}"']/g, '').trim();
+        if (doi) existingDois.add(doi.toLowerCase());
       }
 
-      // Also check citation keys that look like bibcodes
+      // Extract arXiv IDs from eprint fields (handle braces and quotes)
+      const eprintMatches = bibtexContent.matchAll(/eprint\s*=\s*[{"']?([^}"',]+)[}"']?/gi);
+      for (const match of eprintMatches) {
+        const arxivId = normalizeArxivId(match[1]);
+        if (arxivId) existingArxivIds.add(arxivId);
+      }
+
+      // Also look for arXiv IDs anywhere in the content
+      const arxivPatternMatches = bibtexContent.matchAll(/arXiv[:\s]+(\d{4}\.\d{4,5})/gi);
+      for (const match of arxivPatternMatches) {
+        existingArxivIds.add(match[1].toLowerCase());
+      }
+
+      // Also check for bare arXiv ID pattern in eprint-like contexts
+      const bareArxivMatches = bibtexContent.matchAll(/(?:eprint|arxiv|eid)[^=]*=\s*[{"']?(?:arXiv:)?(\d{4}\.\d{4,5})/gi);
+      for (const match of bareArxivMatches) {
+        existingArxivIds.add(match[1].toLowerCase());
+      }
+
+      // Check citation keys that look like bibcodes
       const keyMatches = bibtexContent.matchAll(/@\w+\s*\{\s*(\d{4}[A-Za-z&][^\s,]+)/g);
       for (const match of keyMatches) {
-        if (match[1].length === 19) {
-          existingBibcodes.add(match[1]);
+        const key = match[1];
+        if (key.length >= 18 && key.length <= 20) {
+          existingBibcodes.add(normalizeBibcode(key));
+        }
+        // Extract arXiv ID from arXiv bibcode keys like "2025arXiv251022043B"
+        const arxivKeyMatch = key.match(/^\d{4}arXiv(\d{4})(\d{5})[A-Za-z]$/i);
+        if (arxivKeyMatch) {
+          const arxivId = `${arxivKeyMatch[1]}.${arxivKeyMatch[2]}`;
+          existingArxivIds.add(arxivId.toLowerCase());
         }
       }
 
+      // Helper to get arXiv ID from document
+      const getDocArxivId = (doc) => {
+        if (!doc.identifier) return null;
+        for (const id of doc.identifier) {
+          const match = id.match(/(?:arXiv:)?(\d{4}\.\d{4,5})/i);
+          if (match) return match[1].toLowerCase();
+        }
+        return null;
+      };
+
       // Find papers that are NOT in the .bib file
       const missingPapers = libraryDocs.filter(doc => {
-        if (existingBibcodes.has(doc.bibcode)) return false;
+        const normalizedBibcode = normalizeBibcode(doc.bibcode);
+        if (existingBibcodes.has(normalizedBibcode)) return false;
         if (doc.doi && existingDois.has(doc.doi[0]?.toLowerCase())) return false;
+        const arxivId = getDocArxivId(doc);
+        if (arxivId && existingArxivIds.has(arxivId)) return false;
         return true;
       });
 

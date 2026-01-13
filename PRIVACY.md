@@ -103,7 +103,7 @@ We may update this policy occasionally. Significant changes will be noted in the
 For privacy concerns or questions:
 
 - Open an issue on [GitHub](https://github.com/yipihey/ads-for-overleaf/issues)
-- Email: [your-email@example.com]
+- Email: ads-for-overleaf@tomabel.org
 
 ## Open Source
 

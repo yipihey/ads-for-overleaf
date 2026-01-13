@@ -221,14 +221,34 @@ async function resolveBibtex(bibtexContent) {
 function extractFieldsFromRaw(rawBibtex) {
   const fields = {};
 
-  // Match field = {value} or field = "value" or field = number
-  const fieldRegex = /(\w+)\s*=\s*(?:\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}|"([^"]*)"|(\d+))/g;
-
+  // First try simple fields without nested braces
+  const simpleFieldRegex = /(\w+)\s*=\s*(?:"([^"]*)"|(\d+)(?![.\d]))/g;
   let match;
-  while ((match = fieldRegex.exec(rawBibtex)) !== null) {
+  while ((match = simpleFieldRegex.exec(rawBibtex)) !== null) {
     const fieldName = match[1].toLowerCase();
-    const value = match[2] ?? match[3] ?? match[4] ?? '';
+    const value = match[2] ?? match[3] ?? '';
     fields[fieldName] = value.trim();
+  }
+
+  // Now handle brace-delimited fields with proper brace matching
+  const braceFieldRegex = /(\w+)\s*=\s*\{/g;
+  while ((match = braceFieldRegex.exec(rawBibtex)) !== null) {
+    const fieldName = match[1].toLowerCase();
+    const startPos = match.index + match[0].length;
+
+    // Find matching closing brace
+    let braceCount = 1;
+    let pos = startPos;
+    while (pos < rawBibtex.length && braceCount > 0) {
+      if (rawBibtex[pos] === '{') braceCount++;
+      else if (rawBibtex[pos] === '}') braceCount--;
+      pos++;
+    }
+
+    if (braceCount === 0) {
+      const value = rawBibtex.substring(startPos, pos - 1);
+      fields[fieldName] = value.trim();
+    }
   }
 
   return fields;

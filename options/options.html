@@ -72,7 +72,7 @@
       <!-- Citation Preferences -->
       <section class="section">
         <h2>Citation Preferences</h2>
-        
+
         <div class="form-group">
           <label for="cite-command">Citation Command</label>
           <select id="cite-command">
@@ -82,6 +82,31 @@
             <option value="\\citealt">\\citealt{} (natbib no parens)</option>
             <option value="\\citealp">\\citealp{} (natbib alt parens)</option>
           </select>
+        </div>
+
+        <div class="form-group">
+          <label for="citation-key-mode">Citation Key Style</label>
+          <select id="citation-key-mode">
+            <option value="bibcode">Bibcode — 2020ApJS..249....4S</option>
+            <option value="authoryear">Author + year — Stone2020</option>
+            <option value="informative">Author + year + title slug — Stone20_athena_framework</option>
+            <option value="typed">Use what I typed (fallback to Author+year)</option>
+          </select>
+          <p class="hint">Used when a new entry is added to your project .bib. Collisions get an "a", "b", ... suffix.</p>
+        </div>
+
+        <div class="form-group">
+          <label>
+            <input type="checkbox" id="add-entry-to-bib"> Add the BibTeX entry to the project .bib when I cite a paper
+          </label>
+          <p class="hint">When on, clicking a paper fetches its BibTeX and appends it to the resolved .bib (switching editors briefly).</p>
+        </div>
+
+        <div class="form-group">
+          <label>
+            <input type="checkbox" id="dedupe-on-insert"> Reuse the existing key if the paper is already in the .bib
+          </label>
+          <p class="hint">Match by DOI, bibcode, arXiv ID, or normalised title.</p>
         </div>
       </section>
 

@@ -629,6 +629,71 @@
   margin-top: 12px;
 }
 
+.ads-progress-counts {
+  text-align: center;
+  color: #5f6368;
+  font-size: 12px;
+  margin: 4px 0 12px;
+}
+
+.ads-import-cancelled-note {
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  background: #fff4e5;
+  border: 1px solid #ffd8a8;
+  border-radius: 4px;
+  color: #8a4b00;
+  font-size: 13px;
+}
+
+.ads-bib-picker {
+  padding: 8px 0;
+}
+.ads-bib-picker p {
+  margin: 0 0 10px;
+  font-size: 13px;
+}
+.ads-bib-picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+.ads-bib-picker-item {
+  text-align: left;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+}
+
+/* Context search */
+#ads-context-search-btn {
+  background: transparent;
+  border: 1px solid #e0e0e0;
+  color: #1a73e8;
+  padding: 0 8px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+}
+#ads-context-search-btn:hover {
+  background: #f1f3f4;
+}
+
+.ads-doc-match {
+  margin-top: 4px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.ads-match-kw {
+  display: inline-block;
+  padding: 1px 6px;
+  font-size: 11px;
+  line-height: 1.4;
+  background: #e8f0fe;
+  color: #1967d2;
+  border-radius: 10px;
+}
+
 /* Import results */
 .ads-import-summary {
   margin-bottom: 16px;

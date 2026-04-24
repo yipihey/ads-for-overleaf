@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ADS for Overleaf",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Connect NASA ADS libraries to Overleaf. Search, cite, and export BibTeX directly in the Overleaf editor.",
   "author": "ADS for Overleaf Contributors",
   "homepage_url": "https://github.com/yipihey/ads-for-overleaf",
@@ -24,7 +24,7 @@
   "content_scripts": [
     {
       "matches": ["https://www.overleaf.com/project/*"],
-      "js": ["content/overleaf-injector.js"],
+      "js": ["lib/bib-target.js", "lib/citation-context.js", "lib/bibtex-keys.js", "content/overleaf-injector.js"],
       "css": ["styles/overleaf-panel.css"],
       "run_at": "document_idle"
     }
@@ -62,7 +62,14 @@
   },
   
   "default_locale": "en",
-  
+
+  "web_accessible_resources": [
+    {
+      "resources": ["content/page-bridge.js"],
+      "matches": ["https://*.overleaf.com/*"]
+    }
+  ],
+
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'"
   }

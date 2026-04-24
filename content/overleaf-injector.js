@@ -150,6 +150,292 @@
     });
   }
 
+  // =====================================================================
+  // Page bridge — lets us read/write the active CodeMirror 6 editor from
+  // the isolated content-script world. The bridge script runs in the
+  // page's main world and talks back via custom events.
+  // =====================================================================
+  let bridgeReady = null;
+  function ensurePageBridge() {
+    if (bridgeReady) return bridgeReady;
+    bridgeReady = new Promise((resolve, reject) => {
+      try {
+        const existing = document.querySelector('script[data-ads4ol-bridge]');
+        if (!existing) {
+          const s = document.createElement('script');
+          s.src = chrome.runtime.getURL('content/page-bridge.js');
+          s.dataset.ads4olBridge = '1';
+          s.async = false;
+          s.onerror = () => reject(new Error('Failed to load page bridge'));
+          (document.head || document.documentElement).appendChild(s);
+          s.onload = () => s.remove();
+        }
+        // Probe until ping succeeds or time out (~2s).
+        const start = Date.now();
+        const probe = () => {
+          bridgeRequest('ping', null, 300)
+            .then(() => resolve(true))
+            .catch(() => {
+              if (Date.now() - start > 2000) reject(new Error('Page bridge did not answer'));
+              else setTimeout(probe, 50);
+            });
+        };
+        probe();
+      } catch (err) {
+        reject(err);
+      }
+    });
+    return bridgeReady;
+  }
+
+  function bridgeRequest(action, payload, timeoutMs = 5000) {
+    return new Promise((resolve, reject) => {
+      const id = 'b' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      let done = false;
+      const onResponse = (ev) => {
+        const d = ev && ev.detail;
+        if (!d || d.id !== id) return;
+        cleanup();
+        if (d.ok) resolve(d.result);
+        else reject(new Error(d.error || 'Bridge error'));
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error('Bridge timeout: ' + action));
+      }, timeoutMs);
+      function cleanup() {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        window.removeEventListener('ads4ol:response', onResponse);
+      }
+      window.addEventListener('ads4ol:response', onResponse);
+      window.dispatchEvent(new CustomEvent('ads4ol:request', {
+        detail: { id, action, payload }
+      }));
+    });
+  }
+
+  // =====================================================================
+  // Project file + active-file discovery (DOM scrapers, isolated world)
+  // =====================================================================
+  const PROJECT_FILE_RE = /([A-Za-z0-9_.\-\/ ]+\.(?:tex|bib|sty|cls|bst|bbl|txt|md|csv|json|yaml|yml))\b/i;
+
+  function getProjectId() {
+    const m = window.location.pathname.match(/\/project\/([a-f0-9]{24})/i);
+    return m ? m[1] : '';
+  }
+
+  function collectProjectFiles() {
+    const names = new Set();
+    const selectors = [
+      '[role="treeitem"]',
+      '.file-tree [class*="item"]',
+      '.file-tree li',
+      '[data-testid*="file-tree"] *',
+    ];
+    for (const sel of selectors) {
+      for (const el of document.querySelectorAll(sel)) {
+        const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!text || text.length > 120) continue;
+        const m = text.match(PROJECT_FILE_RE);
+        if (m) names.add(m[1].trim());
+      }
+    }
+    return Array.from(names);
+  }
+
+  function readActiveFileNameFromDom() {
+    const selectors = [
+      '.ol-cm-breadcrumbs',
+      '.ol-cm-toolbar-wrapper',
+      '[role="tab"][aria-selected="true"]',
+      '[role="tab"][data-active="true"]',
+      '.file-tab.active',
+      '.file-tree [aria-selected="true"]',
+      '.file-tree .selected',
+    ];
+    for (const sel of selectors) {
+      const el = document.querySelector(sel);
+      if (!el) continue;
+      const direct = (el.textContent || '').replace(/\s+/g, ' ').trim().match(PROJECT_FILE_RE);
+      if (direct) return direct[1].trim();
+      const matches = [];
+      for (const node of el.querySelectorAll('*')) {
+        const m = (node.textContent || '').replace(/\s+/g, ' ').trim().match(PROJECT_FILE_RE);
+        if (m) matches.push(m[1].trim());
+      }
+      if (matches.length) {
+        matches.sort((a, b) => a.length - b.length);
+        return matches[0];
+      }
+    }
+    return '';
+  }
+
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  async function waitForActiveFile(targetName, timeoutMs = 3500) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const active = readActiveFileNameFromDom();
+      if (active && (active === targetName || active.endsWith(targetName) || active.includes(targetName))) {
+        return true;
+      }
+      await sleep(100);
+    }
+    return false;
+  }
+
+  /**
+   * Click a file in the project file tree to switch the active editor.
+   * Resolves when the breadcrumb/tab reports the new file, rejects on timeout.
+   */
+  async function openProjectFile(fileName) {
+    if (!fileName) throw new Error('openProjectFile: missing fileName');
+    const active = readActiveFileNameFromDom();
+    if (active === fileName || active.endsWith('/' + fileName)) return; // already open
+
+    const candidates = [];
+    const entrySelectors = [
+      '[role="treeitem"]',
+      '.file-tree [class*="item"]',
+      '.file-tree li',
+      '[data-testid*="file-tree"] [role="button"]',
+      '[data-testid*="file-tree"] button',
+      '[data-testid*="file-tree"] a',
+    ];
+    const base = fileName.toLowerCase();
+    for (const sel of entrySelectors) {
+      for (const el of document.querySelectorAll(sel)) {
+        const text = (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        if (text && (text === base || text.endsWith('/' + base) || text.includes(' ' + base) || text === base)) {
+          candidates.push(el);
+        }
+      }
+    }
+    if (!candidates.length) {
+      // Fall back: any element whose trimmed text ends with the filename.
+      for (const el of document.querySelectorAll('span, div, button, a')) {
+        const text = (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        if (text === base && el.offsetParent) candidates.push(el);
+      }
+    }
+    if (!candidates.length) {
+      throw new Error('Could not find "' + fileName + '" in the project file tree.');
+    }
+
+    let lastErr = null;
+    for (const el of candidates.slice(0, 4)) {
+      try {
+        el.scrollIntoView && el.scrollIntoView({ block: 'center', inline: 'nearest' });
+        el.click();
+        if (await waitForActiveFile(fileName, 3500)) return;
+      } catch (e) { lastErr = e; }
+      await sleep(150);
+    }
+    throw lastErr || new Error('Failed to switch to ' + fileName);
+  }
+
+  /**
+   * Build project state for resolveBibTarget.
+   * texContent is the active editor's text (if the user is in a .tex it's
+   * what we scan for \bibliography{}).
+   */
+  async function buildProjectState() {
+    let activeEditor = null;
+    try {
+      await ensurePageBridge();
+      activeEditor = await bridgeRequest('getActiveEditor', null, 4000);
+    } catch (_) { /* falls back to empty state */ }
+    const prefs = state.preferences || (await sendMessage({ action: 'getPreferences', payload: {} }));
+    return {
+      texContent: activeEditor?.text || '',
+      activeFileName: (activeEditor && activeEditor.fileName) || readActiveFileNameFromDom(),
+      projectFiles: collectProjectFiles(),
+      projectId: getProjectId(),
+      overrides: (prefs && prefs.bibFileOverrides) || {},
+    };
+  }
+
+  async function saveBibFileOverride(projectId, bibFileName) {
+    if (!projectId || !bibFileName) return;
+    const prefs = state.preferences || (await sendMessage({ action: 'getPreferences', payload: {} }));
+    const next = { ...(prefs.bibFileOverrides || {}), [projectId]: bibFileName };
+    await sendMessage({ action: 'setPreferences', payload: { bibFileOverrides: next } });
+    state.preferences = { ...prefs, bibFileOverrides: next };
+  }
+
+  /**
+   * High-level wrapper: resolve the target .bib, switch to it, read it,
+   * optionally write it, switch back. Guarantees we attempt to restore the
+   * original active file on error.
+   *
+   * @param {(bibText: string, ctx: { target: string }) => Promise<string|null>} fn
+   *   Callback receives bib text; returns new bib text to write, or null/undefined
+   *   if read-only.
+   * @param {Object} [opts]
+   * @param {(candidates: string[]) => Promise<string|null>} [opts.pickOnAmbiguous]
+   *   Called when resolveBibTarget returns 'needs-choice'. Must resolve to the
+   *   chosen filename, or null to abort.
+   * @returns {Promise<{ target: string, originalFile: string, wrote: boolean }>}
+   */
+  async function withBibFile(fn, opts = {}) {
+    if (!window.ADS4OL || typeof window.ADS4OL.resolveBibTarget !== 'function') {
+      throw new Error('bib-target module not loaded');
+    }
+    await ensurePageBridge();
+
+    const projState = await buildProjectState();
+    let resolution = window.ADS4OL.resolveBibTarget(projState);
+
+    if (resolution.status === 'needs-choice') {
+      if (!opts.pickOnAmbiguous) {
+        throw new Error('Multiple .bib files in project — pick one first.');
+      }
+      const chosen = await opts.pickOnAmbiguous(resolution.candidates);
+      if (!chosen) throw new Error('Import cancelled.');
+      await saveBibFileOverride(projState.projectId, chosen);
+      resolution = { status: 'resolved', target: chosen, candidates: resolution.candidates, reason: 'user-picked' };
+    }
+    if (resolution.status === 'not-found') {
+      throw new Error('No .bib file found in this project.');
+    }
+
+    const originalFile = projState.activeFileName;
+    const target = resolution.target;
+    const needsSwitch = !originalFile || !(originalFile === target || originalFile.endsWith('/' + target) || originalFile.endsWith(target));
+
+    try {
+      if (needsSwitch) {
+        await openProjectFile(target);
+        await sleep(150); // let CM settle
+      }
+      const editor = await bridgeRequest('getActiveEditor', null, 4000);
+      const bibText = editor.text;
+
+      const newText = await fn(bibText, { target });
+      let wrote = false;
+
+      if (typeof newText === 'string' && newText !== bibText) {
+        await bridgeRequest('replaceDocument', {
+          text: newText,
+          expectedFileName: target,
+          expectedLength: bibText.length,
+          expectedHead: bibText.slice(0, 200),
+          expectedTail: bibText.slice(-200),
+        }, 10000);
+        wrote = true;
+      }
+      return { target, originalFile, wrote };
+    } finally {
+      const returnToSource = state.preferences?.returnToSourceAfterBib !== false;
+      if (needsSwitch && returnToSource && originalFile && originalFile !== target) {
+        try { await openProjectFile(originalFile); } catch (_) { /* best-effort */ }
+      }
+    }
+  }
+
   /**
    * Handle messages from background script
    */
@@ -226,6 +512,13 @@
             <path d="M15.5 14h-.79l-.28-.27a6.5 6.5 0 0 0 1.48-5.34c-.47-2.78-2.79-5-5.59-5.34a6.505 6.505 0 0 0-7.27 7.27c.34 2.8 2.56 5.12 5.34 5.59a6.5 6.5 0 0 0 5.34-1.48l.27.28v.79l4.25 4.25c.41.41 1.08.41 1.49 0 .41-.41.41-1.08 0-1.49L15.5 14zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/>
           </svg>
         </button>
+        <button id="ads-context-search-btn"
+                title="Search NASA ADS using the sentence around your cursor"
+                aria-label="Context-aware search from editor cursor">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true">
+            <path d="M4 6h16v2H4V6zm0 5h10v2H4v-2zm0 5h16v2H4v-2zm14-5 2.5 2.5L22 12l-4 4-1.5-1.5L19 12z"/>
+          </svg>
+        </button>
       </div>
 
       <div class="ads-tabs" role="tablist" aria-label="Content tabs">
@@ -266,6 +559,7 @@
     sidebar.querySelector('#ads-search-input').addEventListener('keypress', handleSearchKeypress);
     sidebar.querySelector('#ads-search-input').addEventListener('input', handleSearchInput);
     sidebar.querySelector('#ads-search-btn').addEventListener('click', performSearch);
+    sidebar.querySelector('#ads-context-search-btn').addEventListener('click', performContextSearch);
     sidebar.querySelector('#ads-library-select').addEventListener('change', handleLibraryChange);
     sidebar.querySelector('#ads-refresh-btn').addEventListener('click', async () => {
       await loadLibraries(true);
@@ -636,6 +930,11 @@
     const year = doc.year || '';
     const title = doc.title?.[0] || 'Untitled';
     const escapedBibcode = escapeHtml(doc.bibcode);
+    const matched = Array.isArray(doc.__matchedKeywords) ? doc.__matchedKeywords : [];
+    const matchedHtml = matched.length
+      ? `<div class="ads-doc-match">${matched.slice(0, 6).map(w =>
+          `<span class="ads-match-kw">${escapeHtml(w)}</span>`).join('')}</div>`
+      : '';
 
     return `
       <div class="ads-doc-item" data-bibcode="${escapedBibcode}"
@@ -646,6 +945,7 @@
           <span class="ads-doc-authors">${escapeHtml(authors)}</span>
           <span class="ads-doc-year">${year}</span>
         </div>
+        ${matchedHtml}
         <div class="ads-doc-actions">
           <button class="ads-doc-bibtex" data-bibcode="${escapedBibcode}"
                   title="Copy BibTeX" aria-label="Copy BibTeX for ${escapeHtml(authors)} ${year}">BibTeX</button>
@@ -718,6 +1018,88 @@
   }
 
   /**
+   * Context-aware search: read the active editor, extract the sentence
+   * around the cursor, turn it into ADS queries, run them, rerank the
+   * results by keyword overlap. Silently no-ops on non-.tex files.
+   */
+  async function performContextSearch() {
+    if (!window.ADS4OL || typeof window.ADS4OL.extractCitationContext !== 'function') {
+      setError('Context module not loaded — reload the extension.');
+      return;
+    }
+
+    // Move to the Search ADS tab so results are visible.
+    switchTab('search');
+    setLoading(true);
+    setStatus('Reading editor for context...');
+
+    try {
+      await ensurePageBridge();
+      const editor = await bridgeRequest('getActiveEditor', null, 3000);
+      const text = (editor && editor.text) || '';
+      const cursor = (editor && editor.from) != null ? editor.from : 0;
+
+      // Context search only makes sense in a .tex-like source. Bail cleanly
+      // on a .bib or similar to avoid junk queries from BibTeX tokens.
+      const activeName = (editor && editor.fileName) || readActiveFileNameFromDom();
+      if (activeName && !/\.(tex|ltx|md)$/i.test(activeName)) {
+        setStatus(`Context search needs a .tex file (active: ${activeName}).`);
+        return;
+      }
+
+      const ctx = window.ADS4OL.extractCitationContext(text, cursor);
+      if (!ctx.keywords || ctx.keywords.length < 2) {
+        setStatus('Not enough context around the cursor — type a sentence or move near one.');
+        return;
+      }
+
+      const queries = window.ADS4OL.buildContextQueries(ctx);
+      if (queries.length === 0) {
+        setStatus('Could not build an ADS query from the cursor context.');
+        return;
+      }
+
+      // Run queries in order, stop once we have enough candidates.
+      const TARGET_COUNT = 20;
+      const merged = [];
+      const seen = new Set();
+      for (const q of queries) {
+        if (merged.length >= TARGET_COUNT) break;
+        setStatus(`Querying ADS (${merged.length}/${TARGET_COUNT})...`);
+        const result = await sendMessage({
+          action: 'search',
+          payload: { query: q, rows: 20 }
+        }).catch((e) => {
+          console.log('ADS context query failed:', q, e);
+          return { documents: [] };
+        });
+        for (const doc of (result.documents || [])) {
+          if (!seen.has(doc.bibcode)) { seen.add(doc.bibcode); merged.push(doc); }
+        }
+      }
+
+      if (merged.length === 0) {
+        state.searchResults = [];
+        renderSearchResults();
+        setStatus('No matches for this context.');
+        return;
+      }
+
+      const reranked = window.ADS4OL.rerankByContext(merged, ctx);
+      state.searchResults = reranked;
+      state.lastContextKeywords = ctx.keywords;
+      renderSearchResults();
+
+      const kw = ctx.keywords.slice(0, 5).join(', ');
+      setStatus(`Found ${reranked.length} papers for: ${kw}${ctx.keywords.length > 5 ? '…' : ''}`);
+    } catch (error) {
+      setError(error.message || 'Context search failed');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  /**
    * Render search results
    */
   function renderSearchResults() {
@@ -735,22 +1117,148 @@
   }
 
   /**
-   * Insert citation at cursor
+   * Look up a document by bibcode in whichever result list is live.
+   */
+  function findDocByBibcode(bibcode) {
+    if (!bibcode) return null;
+    const all = [].concat(state.searchResults || [], state.documents || []);
+    return all.find(d => d && d.bibcode === bibcode) || null;
+  }
+
+  /**
+   * Insert citation at cursor.
+   *
+   * Fast path (addEntryToBibOnInsert = false): drop `\cite{bibcode}` at the
+   * cursor, unchanged from the original behaviour.
+   *
+   * Smart path (addEntryToBibOnInsert = true):
+   *   1. Remember the active editor + cursor (so we can write back there).
+   *   2. Open the target .bib via withBibFile.
+   *   3. If the paper is already in the .bib (matched by DOI / bibcode /
+   *      arXiv / title), reuse the existing cite key.
+   *   4. Otherwise fetch BibTeX, generate a new key per `citationKeyMode`,
+   *      rewrite the entry header, append to the .bib.
+   *   5. Switch back and insert `\cite{finalKey}` at the remembered cursor.
    */
   async function insertCitation(bibcode) {
-    const citeCmd = state.preferences?.citeCommand || '\\cite';
-    const citation = `${citeCmd}{${bibcode}}`;
+    const prefs = state.preferences || {};
+    const citeCmd = prefs.citeCommand || '\\cite';
+    const addToBib = prefs.addEntryToBibOnInsert !== false;
+    const dedupe = prefs.dedupeOnInsert !== false;
+    const keyMode = prefs.citationKeyMode || 'bibcode';
 
-    setStatus('Inserting citation...');
+    // Fast path.
+    if (!addToBib) {
+      const citation = `${citeCmd}{${bibcode}}`;
+      setStatus('Inserting citation...');
+      const ok = await insertTextAtCursor(citation);
+      if (ok) setStatus(`Inserted: ${citation}`);
+      else { await copyToClipboard(citation); setStatus(`Copied to clipboard: ${citation}`); }
+      return;
+    }
 
-    // Try to insert into editor
-    const success = await insertTextAtCursor(citation);
-    if (success) {
+    // Smart path — requires bridge + bibtex-keys to be available.
+    if (!window.ADS4OL || typeof window.ADS4OL.parseBibEntries !== 'function') {
+      // Degrade to fast path silently if helpers failed to load.
+      const citation = `${citeCmd}{${bibcode}}`;
+      await insertTextAtCursor(citation);
       setStatus(`Inserted: ${citation}`);
-    } else {
-      // Fallback: copy to clipboard
-      await copyToClipboard(citation);
-      setStatus(`Copied to clipboard: ${citation}`);
+      return;
+    }
+
+    const doc = findDocByBibcode(bibcode) || { bibcode };
+
+    setStatus('Preparing citation...');
+    let originalState = null;
+    try {
+      await ensurePageBridge();
+      try { originalState = await bridgeRequest('getActiveEditor', null, 3000); }
+      catch (_) { originalState = null; }
+
+      let finalKey = null;
+      let matchReason = null;
+      let appended = false;
+
+      await withBibFile(async (bibText) => {
+        const entries = window.ADS4OL.parseBibEntries(bibText || '');
+
+        if (dedupe) {
+          const candidate = {
+            doi: Array.isArray(doc.doi) ? doc.doi[0] : doc.doi,
+            bibcode: doc.bibcode || bibcode,
+            title: Array.isArray(doc.title) ? doc.title[0] : doc.title,
+            eprint: doc.eprint,
+            identifier: doc.identifier,
+          };
+          const hit = window.ADS4OL.findBibMatch(entries, candidate);
+          if (hit) { finalKey = hit.key; matchReason = hit.reason; return null; }
+        }
+
+        // Fetch BibTeX for this bibcode.
+        setStatus('Fetching BibTeX...');
+        const exportResult = await sendMessage({
+          action: 'exportBibtex',
+          payload: { bibcodes: [bibcode], options: prefs }
+        });
+        const rawBibtex = (exportResult && exportResult.bibtex || '').trim();
+        if (!rawBibtex) throw new Error('ADS returned no BibTeX for ' + bibcode);
+
+        const existingKeys = entries.map(e => e.key);
+        const keyDoc = {
+          bibcode: doc.bibcode || bibcode,
+          year: Array.isArray(doc.year) ? doc.year[0] : doc.year,
+          author: doc.author,
+          title: Array.isArray(doc.title) ? doc.title[0] : doc.title,
+        };
+        finalKey = window.ADS4OL.generateKey(keyDoc, existingKeys, {
+          mode: keyMode,
+          typed: '',
+        });
+
+        const rewritten = window.ADS4OL.rewriteBibtexKey(rawBibtex, finalKey);
+        const hadText = bibText && bibText.trim();
+        const head = hadText ? bibText.replace(/\s+$/, '') + '\n\n' : '';
+        appended = true;
+        return head + rewritten.trimEnd() + '\n';
+      }, {
+        pickOnAmbiguous: (candidates) => promptSidebarBibPicker(candidates),
+      });
+
+      if (!finalKey) finalKey = bibcode;
+
+      // Insert at the remembered cursor. Prefer the bridge's replaceRange
+      // (targeted, guarded) over the generic insertTextAtCursor.
+      const citation = `${citeCmd}{${finalKey}}`;
+      let inserted = false;
+      if (originalState && originalState.fileName) {
+        try {
+          await bridgeRequest('replaceRange', {
+            from: originalState.from,
+            to: originalState.to,
+            insert: citation,
+            expectedFileName: originalState.fileName,
+          }, 5000);
+          inserted = true;
+        } catch (_) { /* fall through */ }
+      }
+      if (!inserted) inserted = await insertTextAtCursor(citation);
+
+      if (!inserted) {
+        await copyToClipboard(citation);
+        setStatus(`Copied to clipboard: ${citation}`);
+        return;
+      }
+
+      if (matchReason) setStatus(`Reused ${finalKey} (${matchReason} match)`);
+      else if (appended) setStatus(`Inserted ${finalKey} and added to .bib`);
+      else setStatus(`Inserted ${citation}`);
+    } catch (err) {
+      // Last-ditch fallback to preserve the old behaviour on any failure.
+      console.warn('ADS: smart insert failed, falling back:', err);
+      const citation = `${citeCmd}{${bibcode}}`;
+      const ok = await insertTextAtCursor(citation);
+      if (ok) setStatus(`Inserted: ${citation} (fallback — ${err.message || 'error'})`);
+      else { await copyToClipboard(citation); setStatus(`Copied to clipboard: ${citation}`); }
     }
   }
 
@@ -1401,6 +1909,10 @@
         <p id="ads-import-progress-text" class="ads-progress-status">
           <span class="ads-spinner"></span>Processing...
         </p>
+        <p id="ads-import-progress-counts" class="ads-progress-counts" style="display:none"></p>
+        <div class="ads-modal-actions" id="ads-import-progress-actions" style="display:none">
+          <button id="ads-import-cancel-scan-btn" class="ads-btn secondary">Cancel</button>
+        </div>
       </div>
 
       <div class="ads-import-step" id="ads-import-step-results" style="display:none">
@@ -1473,6 +1985,59 @@
     }
   }
 
+  // Chunk size keeps each resolveBibtexChunk round-trip well under the
+  // MV3 30s service-worker idle window even for slow connections.
+  //
+  // Each chunk is now batch-resolved on the SW side — a single ADS call
+  // handles up to 100 identifier-bearing entries — so we can afford to send
+  // larger chunks without increasing query count. The practical cap is
+  // title-only entries within the chunk (still one query apiece): with ~30%
+  // title-only entries, a 200-item chunk is ~60 serial-ish queries, well
+  // under 30s at 10 req/s.
+  const IMPORT_CHUNK_SIZE = 200;
+
+  /**
+   * Render an inline .bib picker by hiding the progress step's children and
+   * appending the picker. Resolves to the chosen filename, or null on
+   * cancel. Leaves the progress step's original children intact so DOM
+   * references captured by the caller remain valid.
+   */
+  function promptBibFilePicker(candidates, progressStep) {
+    const hidden = [];
+    for (const child of Array.from(progressStep.children)) {
+      hidden.push([child, child.style.display]);
+      child.style.display = 'none';
+    }
+    const picker = document.createElement('div');
+    picker.className = 'ads-bib-picker';
+    picker.innerHTML = `
+      <p>This project has several <code>.bib</code> files. Which one should receive the import?</p>
+      <div class="ads-bib-picker-list">
+        ${candidates.map(f => `<button type="button" class="ads-btn secondary ads-bib-picker-item" data-bib="${escapeHtml(f)}">${escapeHtml(f)}</button>`).join('')}
+      </div>
+      <div class="ads-modal-actions">
+        <button type="button" class="ads-btn secondary" data-bib-cancel="1">Cancel</button>
+      </div>
+    `;
+    progressStep.appendChild(picker);
+
+    return new Promise((resolve) => {
+      const finish = (value) => {
+        picker.remove();
+        for (const [child, prev] of hidden) child.style.display = prev || '';
+        resolve(value);
+      };
+      picker.querySelectorAll('[data-bib]').forEach((btn) => {
+        btn.addEventListener('click', () => finish(btn.dataset.bib), { once: true });
+      });
+      picker.querySelector('[data-bib-cancel]')
+        .addEventListener('click', () => finish(null), { once: true });
+    });
+  }
+
+  // Flipped by the Cancel button during an in-progress scan.
+  let importScanCancelled = false;
+
   /**
    * Start the import scan process
    */
@@ -1505,37 +2070,149 @@
 
     const progressBar = modalContent.querySelector('#ads-import-progress-bar');
     const progressText = modalContent.querySelector('#ads-import-progress-text');
+    const progressCounts = modalContent.querySelector('#ads-import-progress-counts');
+    const progressActions = modalContent.querySelector('#ads-import-progress-actions');
+    const cancelScanBtn = modalContent.querySelector('#ads-import-cancel-scan-btn');
 
-    // Phase 1: Reading file
-    progressText.innerHTML = '<span class="ads-spinner"></span>Reading file...';
+    // Reset progress UI
+    progressBar.classList.add('indeterminate');
+    progressBar.style.width = '';
+    progressCounts.style.display = 'none';
+    progressCounts.textContent = '';
+    progressActions.style.display = 'none';
+    importScanCancelled = false;
+    cancelScanBtn.disabled = false;
+    cancelScanBtn.textContent = 'Cancel';
+    cancelScanBtn.onclick = () => {
+      importScanCancelled = true;
+      cancelScanBtn.disabled = true;
+      cancelScanBtn.textContent = 'Cancelling...';
+    };
 
-    const bibtexContent = await readEditorContent();
+    // Phase 1: Locate and read the target .bib file — anywhere in the project.
+    progressText.innerHTML = '<span class="ads-spinner"></span>Locating .bib file...';
 
-    if (!bibtexContent) {
+    let bibtexContent = '';
+    let resolvedTarget = '';
+    try {
+      const pickedWrap = await withBibFile(async (bibText, ctx) => {
+        bibtexContent = bibText || '';
+        resolvedTarget = ctx.target;
+        return null; // read-only
+      }, {
+        pickOnAmbiguous: (candidates) => promptBibFilePicker(candidates, progressStep),
+      });
+      if (resolvedTarget && pickedWrap?.target) {
+        progressText.innerHTML = `<span class="ads-spinner"></span>Using <strong>${escapeHtml(pickedWrap.target)}</strong>...`;
+      }
+    } catch (err) {
       progressStep.style.display = 'none';
       configStep.style.display = 'block';
-      setError('Could not read editor content. Make sure a .bib file is open in the editor.');
+      setError(err.message || 'Could not read a .bib file from this project.');
+      return;
+    }
+
+    if (!bibtexContent || !bibtexContent.trim()) {
+      progressStep.style.display = 'none';
+      configStep.style.display = 'block';
+      setError(`The .bib file${resolvedTarget ? ' (' + resolvedTarget + ')' : ''} appears to be empty.`);
       return;
     }
 
     try {
-      // Phase 2: Resolving entries
-      progressText.innerHTML = '<span class="ads-spinner"></span>Resolving entries (this may take a while)...';
+      // Phase 2: Parse locally in the SW (fast, no network)
+      progressText.innerHTML = '<span class="ads-spinner"></span>Parsing BibTeX...';
 
-      const result = await sendMessage({
-        action: 'resolveBibtex',
+      const parsed = await sendMessage({
+        action: 'parseBibtex',
         payload: { bibtexContent }
       });
+      const entries = parsed?.entries || [];
 
-      // Phase 3: Show results
+      if (entries.length === 0) {
+        progressStep.style.display = 'none';
+        configStep.style.display = 'block';
+        setError('No BibTeX entries found in the file.');
+        return;
+      }
+
+      // Phase 3: Resolve in chunks, streaming progress
+      const total = entries.length;
+      const allResults = [];
+      let foundCount = 0;
+      let notFoundCount = 0;
+
       progressBar.classList.remove('indeterminate');
+      progressBar.style.width = '0%';
+      progressCounts.style.display = 'block';
+      progressActions.style.display = 'block';
+
+      const updateProgress = () => {
+        const done = allResults.length;
+        const pct = total > 0 ? Math.floor((done / total) * 100) : 0;
+        progressBar.style.width = `${pct}%`;
+        progressText.innerHTML = `<span class="ads-spinner"></span>Resolving entries... ${done} / ${total}`;
+        progressCounts.textContent = `Found: ${foundCount} · Not found: ${notFoundCount}`;
+      };
+      updateProgress();
+
+      let chunkErrorCount = 0;
+      let lastChunkError = null;
+      for (let i = 0; i < entries.length; i += IMPORT_CHUNK_SIZE) {
+        if (importScanCancelled) break;
+
+        const chunk = entries.slice(i, i + IMPORT_CHUNK_SIZE);
+        let chunkResults = [];
+        try {
+          const chunkResult = await sendMessage({
+            action: 'resolveBibtexChunk',
+            payload: { entries: chunk }
+          });
+          chunkResults = chunkResult?.results || [];
+        } catch (err) {
+          // One bad chunk shouldn't abort the whole import. Record the
+          // entries as unresolved-with-error and continue.
+          chunkErrorCount++;
+          lastChunkError = err;
+          chunkResults = chunk.map(e => ({
+            citeKey: e.citeKey,
+            entryType: e.entryType,
+            bibcode: null,
+            method: 'not_found',
+            confidence: 0,
+            fields: e.fields,
+            error: err.message || String(err),
+          }));
+        }
+
+        for (const r of chunkResults) {
+          allResults.push(r);
+          if (r.bibcode) foundCount++;
+          else notFoundCount++;
+        }
+        updateProgress();
+      }
+
+      if (chunkErrorCount > 0) {
+        console.warn(
+          `ADS import: ${chunkErrorCount} chunk(s) failed. Last error:`,
+          lastChunkError
+        );
+      }
+
+      // Phase 4: Show results (full or partial if cancelled)
+      const categorized = categorizeResultsLocal(allResults);
+
       progressStep.style.display = 'none';
       resultsStep.style.display = 'block';
 
-      const { categorized } = result;
       const resultsDiv = modalContent.querySelector('#ads-import-results');
+      const cancelledNote = importScanCancelled
+        ? `<p class="ads-import-cancelled-note"><em>Scan cancelled — showing ${allResults.length} of ${total} entries.</em></p>`
+        : '';
 
       resultsDiv.innerHTML = `
+        ${cancelledNote}
         <div class="ads-import-summary">
           <p><strong>Found:</strong> ${categorized.stats.foundCount} papers</p>
           <p><strong>Not found:</strong> ${categorized.stats.notFoundCount} entries</p>
@@ -1597,6 +2274,33 @@
   }
 
   /**
+   * Categorize resolution results locally (matches categorizeResults in bibtex-resolver.js).
+   * Kept client-side to avoid a pointless round-trip after all chunks have returned.
+   */
+  function categorizeResultsLocal(results) {
+    const found = results.filter(r => r.bibcode !== null && r.bibcode !== undefined);
+    const notFound = results.filter(r => !r.bibcode);
+    const errors = results.filter(r => r.error);
+    return {
+      found,
+      notFound,
+      errors,
+      stats: {
+        total: results.length,
+        foundCount: found.length,
+        notFoundCount: notFound.length,
+        errorCount: errors.length,
+        byMethod: {
+          bibcode: found.filter(r => r.method === 'bibcode').length,
+          doi: found.filter(r => r.method === 'doi').length,
+          arxiv: found.filter(r => r.method === 'arxiv').length,
+          title: found.filter(r => r.method === 'title').length,
+        },
+      },
+    };
+  }
+
+  /**
    * Confirm and execute the import
    */
   async function confirmImport() {
@@ -1612,38 +2316,70 @@
     }
 
     try {
-      setStatus('Creating library...');
+      // Each sendMessage round-trip must finish well under the MV3 ~30s
+      // service-worker idle window; otherwise the message port closes and
+      // the caller sees "asynchronous response ... message channel closed".
+      // We therefore drive the ADS writes from here in batches of
+      // ADD_LIB_CHUNK bibcodes per message.
+      const ADD_LIB_CHUNK = 400;
+
+      const firstChunk = bibcodes.slice(0, ADD_LIB_CHUNK);
+      const restChunks = [];
+      for (let i = ADD_LIB_CHUNK; i < bibcodes.length; i += ADD_LIB_CHUNK) {
+        restChunks.push(bibcodes.slice(i, i + ADD_LIB_CHUNK));
+      }
 
       let newLibraryId = null;
+      let totalAdded = 0;
+      const totalToAdd = bibcodes.length;
+      const extractAdded = (r, fallback) => {
+        if (!r) return fallback;
+        if (typeof r.number_added === 'number') return r.number_added;
+        if (typeof r.added === 'number') return r.added;
+        return fallback;
+      };
 
       if (isNewLibrary) {
-        // Create new library with papers
+        setStatus(`Creating library (${Math.min(firstChunk.length, totalToAdd)} / ${totalToAdd})...`);
         const result = await sendMessage({
           action: 'createLibrary',
           payload: {
             name: newLibName,
             options: {
               description: newLibDesc || `Imported from Overleaf on ${new Date().toLocaleDateString()}`,
-              bibcodes: bibcodes,
+              bibcodes: firstChunk,
               isPublic: false
             }
           }
         });
-
-        newLibraryId = result.id;
-        setStatus(`Created library "${newLibName}" with ${bibcodes.length} papers`);
+        newLibraryId = result && result.id;
+        totalAdded += extractAdded(result, firstChunk.length);
+        if (!newLibraryId) throw new Error('ADS did not return a library id.');
       } else {
-        // Add to existing library
+        newLibraryId = existingLibId;
+        if (firstChunk.length) {
+          setStatus(`Adding ${Math.min(firstChunk.length, totalToAdd)} / ${totalToAdd}...`);
+          const result = await sendMessage({
+            action: 'addToLibrary',
+            payload: { libraryId: existingLibId, bibcodes: firstChunk }
+          });
+          totalAdded += extractAdded(result, firstChunk.length);
+        }
+      }
+
+      for (const chunk of restChunks) {
+        setStatus(`Adding ${Math.min(totalAdded + chunk.length, totalToAdd)} / ${totalToAdd}...`);
         const result = await sendMessage({
           action: 'addToLibrary',
-          payload: {
-            libraryId: existingLibId,
-            bibcodes: bibcodes
-          }
+          payload: { libraryId: newLibraryId, bibcodes: chunk }
         });
+        totalAdded += extractAdded(result, chunk.length);
+      }
 
-        newLibraryId = existingLibId;
-        setStatus(`Added ${result.added} papers to library`);
+      if (isNewLibrary) {
+        setStatus(`Created library "${newLibName}" with ${totalAdded} papers`);
+      } else {
+        setStatus(`Added ${totalAdded} papers to library`);
       }
 
       // Refresh libraries list
@@ -1671,112 +2407,40 @@
    * Used to show notification badge on "Add to .bib" button
    */
   async function countMissingInBib() {
-    // Only check if we have documents and a .bib file is open
     if (!state.documents || state.documents.length === 0) {
       return 0;
     }
 
-    if (!state.currentBibFile) {
-      return 0;
-    }
-
     try {
-      const bibtexContent = await readEditorContent();
+      // Only read when a .bib file is already the active editor — we do not
+      // switch files just to compute the badge.
+      const active = readActiveFileNameFromDom();
+      if (!active || !/\.bib$/i.test(active)) {
+        return 0;
+      }
+      await ensurePageBridge();
+      const editor = await bridgeRequest('getActiveEditor', null, 2000);
+      const bibtexContent = editor?.text || '';
       if (!bibtexContent) return 0;
 
-      // Extract existing identifiers from .bib content
-      const existingBibcodes = new Set();
-      const existingDois = new Set();
-      const existingArxivIds = new Set();
-
-      // Helper to normalize bibcodes (remove dots for comparison)
+      const { bibcodes, dois, arxivIds } = extractExistingBibIdentifiers(bibtexContent);
       const normalizeBibcode = (bc) => bc.replace(/\./g, '').toLowerCase();
-
-      // Helper to normalize and validate arXiv IDs
-      // Returns null if not a valid arXiv ID format (YYMM.nnnnn)
-      const normalizeArxivId = (id) => {
-        const cleaned = id.replace(/^arXiv:/i, '').trim().toLowerCase();
-        // Validate it's a modern arXiv ID format: YYMM.nnnnn (4 digits, dot, 4-5 digits)
-        if (/^\d{4}\.\d{4,5}$/.test(cleaned)) {
-          return cleaned;
-        }
-        return null;
-      };
-
-      // Match adsurl fields to extract bibcodes
-      const bibcodeMatches = bibtexContent.matchAll(/\/abs\/([A-Za-z0-9.]+)/gi);
-      for (const match of bibcodeMatches) {
-        existingBibcodes.add(normalizeBibcode(match[1]));
-      }
-
-      // Match DOI fields (handle braces, quotes, and nested braces)
-      const doiMatches = bibtexContent.matchAll(/doi\s*=\s*\{?\{?["']?([0-9][0-9./\-A-Za-z:]+)["']?\}?\}?/gi);
-      for (const match of doiMatches) {
-        const doi = match[1].replace(/[{}"']/g, '').trim();
-        if (doi) existingDois.add(doi.toLowerCase());
-      }
-
-      // Match eprint fields (handle braces and quotes)
-      const eprintMatches = bibtexContent.matchAll(/eprint\s*=\s*[{"']?([^}"',]+)[}"']?/gi);
-      for (const match of eprintMatches) {
-        const arxivId = normalizeArxivId(match[1]);
-        if (arxivId) existingArxivIds.add(arxivId);
-      }
-
-      // Also look for arXiv IDs anywhere in the content (arXiv:YYMM.nnnnn pattern)
-      const arxivPatternMatches = bibtexContent.matchAll(/arXiv[:\s]+(\d{4}\.\d{4,5})/gi);
-      for (const match of arxivPatternMatches) {
-        existingArxivIds.add(match[1].toLowerCase());
-      }
-
-      // Also check for bare arXiv ID pattern in eprint-like contexts
-      const bareArxivMatches = bibtexContent.matchAll(/(?:eprint|arxiv|eid)[^=]*=\s*[{"']?(?:arXiv:)?(\d{4}\.\d{4,5})/gi);
-      for (const match of bareArxivMatches) {
-        existingArxivIds.add(match[1].toLowerCase());
-      }
-
-      // Check citation keys that look like bibcodes (starts with year, reasonable length)
-      const keyMatches = bibtexContent.matchAll(/@\w+\s*\{\s*(\d{4}[A-Za-z&][^\s,]+)/g);
-      for (const match of keyMatches) {
-        const key = match[1];
-        // Accept bibcodes between 18-20 chars (arXiv bibcodes vary)
-        if (key.length >= 18 && key.length <= 20) {
-          existingBibcodes.add(normalizeBibcode(key));
-        }
-        // Extract arXiv ID from arXiv bibcode keys like "2025arXiv251022043B"
-        // Pattern: YYYYarXivYYMMnnnnnL -> arXiv ID is YYMM.nnnnn
-        const arxivKeyMatch = key.match(/^\d{4}arXiv(\d{4})(\d{5})[A-Za-z]$/i);
-        if (arxivKeyMatch) {
-          const arxivId = `${arxivKeyMatch[1]}.${arxivKeyMatch[2]}`;
-          existingArxivIds.add(arxivId.toLowerCase());
-        }
-      }
-
-      // Helper to extract arXiv ID from document identifiers
       const getDocArxivId = (doc) => {
         if (!doc.identifier) return null;
         for (const id of doc.identifier) {
-          // Match formats like "arXiv:2510.22043" or just "2510.22043"
-          const match = id.match(/(?:arXiv:)?(\d{4}\.\d{4,5})/i);
-          if (match) return match[1].toLowerCase();
+          const m = id.match(/(?:arXiv:)?(\d{4}\.\d{4,5})/i);
+          if (m) return m[1].toLowerCase();
         }
         return null;
       };
-
-      // Count papers NOT in .bib
       let missingCount = 0;
       for (const doc of state.documents) {
-        const normalizedDocBibcode = normalizeBibcode(doc.bibcode);
-        const inBibcode = existingBibcodes.has(normalizedDocBibcode);
-        const inDoi = doc.doi && existingDois.has(doc.doi[0]?.toLowerCase());
-        const docArxivId = getDocArxivId(doc);
-        const inArxiv = docArxivId && existingArxivIds.has(docArxivId);
-
-        if (!inBibcode && !inDoi && !inArxiv) {
-          missingCount++;
-        }
+        if (bibcodes.has(normalizeBibcode(doc.bibcode))) continue;
+        if (doc.doi && dois.has(String(doc.doi[0] || '').toLowerCase())) continue;
+        const a = getDocArxivId(doc);
+        if (a && arxivIds.has(a)) continue;
+        missingCount++;
       }
-
       return missingCount;
     } catch (e) {
       console.log('ADS: Error counting missing papers:', e);
@@ -1803,149 +2467,136 @@
   }
 
   /**
-   * Sync papers from selected library to the .bib file (add-only)
+   * Sync papers from selected library to the .bib file (add-only).
+   * Works regardless of which project file is currently active — the helper
+   * resolves the target .bib, switches to it, writes via the page bridge,
+   * and switches back.
    */
   async function syncLibraryToBib() {
-    // Try to detect .bib file
-    updateBibFileState();
-
     if (!state.currentLibrary) {
       setError('Please select a library first');
       return;
     }
 
-    setStatus('Reading .bib file...');
-
+    setStatus('Fetching library...');
     try {
-      // Read current .bib content
-      const bibtexContent = await readEditorContent();
-      if (!bibtexContent) {
-        setError('Could not read editor content');
-        return;
-      }
-
-      // Get library documents
-      setStatus('Fetching library...');
       const libraryResult = await sendMessage({
         action: 'getLibraryDocuments',
         payload: { libraryId: state.currentLibrary, forceRefresh: true }
       });
-
       const libraryDocs = libraryResult.documents || [];
-
-      // Parse existing .bib to find which papers already exist
-      const existingBibcodes = new Set();
-      const existingDois = new Set();
-      const existingArxivIds = new Set();
-
-      // Normalize bibcodes (remove dots for comparison)
-      const normalizeBibcode = (bc) => bc.replace(/\./g, '').toLowerCase();
-      // Normalize and validate arXiv IDs
-      const normalizeArxivId = (id) => {
-        const cleaned = id.replace(/^arXiv:/i, '').trim().toLowerCase();
-        if (/^\d{4}\.\d{4,5}$/.test(cleaned)) {
-          return cleaned;
-        }
-        return null;
-      };
-
-      // Extract bibcodes from adsurl fields
-      const bibcodeMatches = bibtexContent.matchAll(/\/abs\/([A-Za-z0-9.]+)/gi);
-      for (const match of bibcodeMatches) {
-        existingBibcodes.add(normalizeBibcode(match[1]));
-      }
-
-      // Extract DOIs (handle braces, quotes, nested braces)
-      const doiMatches = bibtexContent.matchAll(/doi\s*=\s*\{?\{?["']?([0-9][0-9./\-A-Za-z:]+)["']?\}?\}?/gi);
-      for (const match of doiMatches) {
-        const doi = match[1].replace(/[{}"']/g, '').trim();
-        if (doi) existingDois.add(doi.toLowerCase());
-      }
-
-      // Extract arXiv IDs from eprint fields (handle braces and quotes)
-      const eprintMatches = bibtexContent.matchAll(/eprint\s*=\s*[{"']?([^}"',]+)[}"']?/gi);
-      for (const match of eprintMatches) {
-        const arxivId = normalizeArxivId(match[1]);
-        if (arxivId) existingArxivIds.add(arxivId);
-      }
-
-      // Also look for arXiv IDs anywhere in the content
-      const arxivPatternMatches = bibtexContent.matchAll(/arXiv[:\s]+(\d{4}\.\d{4,5})/gi);
-      for (const match of arxivPatternMatches) {
-        existingArxivIds.add(match[1].toLowerCase());
-      }
-
-      // Also check for bare arXiv ID pattern in eprint-like contexts
-      const bareArxivMatches = bibtexContent.matchAll(/(?:eprint|arxiv|eid)[^=]*=\s*[{"']?(?:arXiv:)?(\d{4}\.\d{4,5})/gi);
-      for (const match of bareArxivMatches) {
-        existingArxivIds.add(match[1].toLowerCase());
-      }
-
-      // Check citation keys that look like bibcodes
-      const keyMatches = bibtexContent.matchAll(/@\w+\s*\{\s*(\d{4}[A-Za-z&][^\s,]+)/g);
-      for (const match of keyMatches) {
-        const key = match[1];
-        if (key.length >= 18 && key.length <= 20) {
-          existingBibcodes.add(normalizeBibcode(key));
-        }
-        // Extract arXiv ID from arXiv bibcode keys like "2025arXiv251022043B"
-        const arxivKeyMatch = key.match(/^\d{4}arXiv(\d{4})(\d{5})[A-Za-z]$/i);
-        if (arxivKeyMatch) {
-          const arxivId = `${arxivKeyMatch[1]}.${arxivKeyMatch[2]}`;
-          existingArxivIds.add(arxivId.toLowerCase());
-        }
-      }
-
-      // Helper to get arXiv ID from document
-      const getDocArxivId = (doc) => {
-        if (!doc.identifier) return null;
-        for (const id of doc.identifier) {
-          const match = id.match(/(?:arXiv:)?(\d{4}\.\d{4,5})/i);
-          if (match) return match[1].toLowerCase();
-        }
-        return null;
-      };
-
-      // Find papers that are NOT in the .bib file
-      const missingPapers = libraryDocs.filter(doc => {
-        const normalizedBibcode = normalizeBibcode(doc.bibcode);
-        if (existingBibcodes.has(normalizedBibcode)) return false;
-        if (doc.doi && existingDois.has(doc.doi[0]?.toLowerCase())) return false;
-        const arxivId = getDocArxivId(doc);
-        if (arxivId && existingArxivIds.has(arxivId)) return false;
-        return true;
-      });
-
-      if (missingPapers.length === 0) {
-        setStatus('All library papers are already in .bib file');
+      if (libraryDocs.length === 0) {
+        setStatus('Library is empty');
         return;
       }
 
-      // Export BibTeX for missing papers
-      setStatus(`Exporting ${missingPapers.length} papers...`);
-      const exportResult = await sendMessage({
-        action: 'exportBibtex',
-        payload: {
-          bibcodes: missingPapers.map(p => p.bibcode),
-          options: state.preferences || {}
-        }
+      setStatus('Locating .bib file...');
+      let missingCount = 0;
+      let fallbackBibtex = null;
+
+      const result = await withBibFile(async (bibtexContent) => {
+        const { bibcodes, dois, arxivIds } = extractExistingBibIdentifiers(bibtexContent || '');
+
+        const getDocArxivId = (doc) => {
+          if (!doc.identifier) return null;
+          for (const id of doc.identifier) {
+            const m = id.match(/(?:arXiv:)?(\d{4}\.\d{4,5})/i);
+            if (m) return m[1].toLowerCase();
+          }
+          return null;
+        };
+        const normalizeBibcode = (bc) => bc.replace(/\./g, '').toLowerCase();
+
+        const missingPapers = libraryDocs.filter(doc => {
+          if (bibcodes.has(normalizeBibcode(doc.bibcode))) return false;
+          if (doc.doi && dois.has(String(doc.doi[0] || '').toLowerCase())) return false;
+          const a = getDocArxivId(doc);
+          if (a && arxivIds.has(a)) return false;
+          return true;
+        });
+        missingCount = missingPapers.length;
+        if (missingCount === 0) return null;
+
+        setStatus(`Exporting ${missingCount} papers...`);
+        const exportResult = await sendMessage({
+          action: 'exportBibtex',
+          payload: {
+            bibcodes: missingPapers.map(p => p.bibcode),
+            options: state.preferences || {}
+          }
+        });
+        fallbackBibtex = exportResult.bibtex;
+
+        const sep = bibtexContent && bibtexContent.trim() ? '\n\n' : '';
+        const trimmed = bibtexContent ? bibtexContent.replace(/\s+$/, '') : '';
+        return trimmed + sep + exportResult.bibtex.trimEnd() + '\n';
+      }, {
+        pickOnAmbiguous: (candidates) => promptSidebarBibPicker(candidates),
       });
 
-      // Append to editor
-      const newBibtex = '\n\n' + exportResult.bibtex;
-      const success = await appendToEditor(newBibtex);
-
-      if (success) {
-        setStatus(`Added ${missingPapers.length} entries to .bib file`);
-      } else {
-        // Fallback: copy to clipboard
-        await copyToClipboard(exportResult.bibtex);
-        setStatus(`Copied ${missingPapers.length} entries to clipboard (paste manually)`);
+      if (missingCount === 0) {
+        setStatus('All library papers are already in .bib file');
+      } else if (result.wrote) {
+        setStatus(`Added ${missingCount} entries to ${result.target}`);
+      } else if (fallbackBibtex) {
+        await copyToClipboard(fallbackBibtex);
+        setStatus(`Copied ${missingCount} entries to clipboard (paste manually)`);
       }
-
     } catch (error) {
       setError(`Sync failed: ${error.message}`);
     }
+  }
+
+  /**
+   * Extract DOI / bibcode / arXiv identifiers from raw .bib text.
+   * Pulled out of syncLibraryToBib so countMissingInBib can reuse it.
+   */
+  function extractExistingBibIdentifiers(bibtexContent) {
+    const bibcodes = new Set();
+    const dois = new Set();
+    const arxivIds = new Set();
+
+    const normalizeBibcode = (bc) => bc.replace(/\./g, '').toLowerCase();
+    const normalizeArxivId = (id) => {
+      const c = id.replace(/^arXiv:/i, '').trim().toLowerCase();
+      return /^\d{4}\.\d{4,5}$/.test(c) ? c : null;
+    };
+
+    for (const m of bibtexContent.matchAll(/\/abs\/([A-Za-z0-9.]+)/gi)) {
+      bibcodes.add(normalizeBibcode(m[1]));
+    }
+    for (const m of bibtexContent.matchAll(/doi\s*=\s*\{?\{?["']?([0-9][0-9./\-A-Za-z:]+)["']?\}?\}?/gi)) {
+      const doi = m[1].replace(/[{}"']/g, '').trim();
+      if (doi) dois.add(doi.toLowerCase());
+    }
+    for (const m of bibtexContent.matchAll(/eprint\s*=\s*[{"']?([^}"',]+)[}"']?/gi)) {
+      const a = normalizeArxivId(m[1]);
+      if (a) arxivIds.add(a);
+    }
+    for (const m of bibtexContent.matchAll(/arXiv[:\s]+(\d{4}\.\d{4,5})/gi)) {
+      arxivIds.add(m[1].toLowerCase());
+    }
+    for (const m of bibtexContent.matchAll(/(?:eprint|arxiv|eid)[^=]*=\s*[{"']?(?:arXiv:)?(\d{4}\.\d{4,5})/gi)) {
+      arxivIds.add(m[1].toLowerCase());
+    }
+    for (const m of bibtexContent.matchAll(/@\w+\s*\{\s*(\d{4}[A-Za-z&][^\s,]+)/g)) {
+      const key = m[1];
+      if (key.length >= 18 && key.length <= 20) bibcodes.add(normalizeBibcode(key));
+      const ak = key.match(/^\d{4}arXiv(\d{4})(\d{5})[A-Za-z]$/i);
+      if (ak) arxivIds.add(`${ak[1]}.${ak[2]}`.toLowerCase());
+    }
+    return { bibcodes, dois, arxivIds };
+  }
+
+  /**
+   * A very small inline picker for flows that don't have a modal available
+   * (sync-to-.bib). Shows a sidebar prompt and returns the chosen filename.
+   */
+  function promptSidebarBibPicker(candidates) {
+    const msg = 'Multiple .bib files in this project. Pick one:\n\n  ' + candidates.join('\n  ');
+    const choice = window.prompt(msg + '\n\nType the exact name:', candidates[0] || '');
+    if (!choice) return Promise.resolve(null);
+    return Promise.resolve(candidates.includes(choice) ? choice : candidates[0]);
   }
 
   // Initialize when DOM is ready

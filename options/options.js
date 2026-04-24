@@ -19,6 +19,9 @@ async function init() {
   document.getElementById('journal-format').addEventListener('change', savePreferences);
   document.getElementById('max-authors').addEventListener('change', savePreferences);
   document.getElementById('cite-command').addEventListener('change', savePreferences);
+  document.getElementById('citation-key-mode').addEventListener('change', savePreferences);
+  document.getElementById('add-entry-to-bib').addEventListener('change', savePreferences);
+  document.getElementById('dedupe-on-insert').addEventListener('change', savePreferences);
 }
 
 async function loadSettings() {
@@ -48,6 +51,10 @@ async function loadSettings() {
   if (prefs.citeCommand) {
     document.getElementById('cite-command').value = prefs.citeCommand;
   }
+
+  document.getElementById('citation-key-mode').value = prefs.citationKeyMode || 'bibcode';
+  document.getElementById('add-entry-to-bib').checked = prefs.addEntryToBibOnInsert !== false;
+  document.getElementById('dedupe-on-insert').checked = prefs.dedupeOnInsert !== false;
 }
 
 async function saveToken() {
@@ -120,7 +127,10 @@ async function savePreferences() {
     bibtexKeyFormat: document.getElementById('key-format').value || null,
     journalFormat: parseInt(document.getElementById('journal-format').value, 10),
     maxAuthors: parseInt(document.getElementById('max-authors').value, 10),
-    citeCommand: document.getElementById('cite-command').value
+    citeCommand: document.getElementById('cite-command').value,
+    citationKeyMode: document.getElementById('citation-key-mode').value,
+    addEntryToBibOnInsert: document.getElementById('add-entry-to-bib').checked,
+    dedupeOnInsert: document.getElementById('dedupe-on-insert').checked,
   };
 
   try {
